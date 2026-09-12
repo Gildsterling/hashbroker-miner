@@ -16,6 +16,9 @@ def candidate():
 
 
 class FakeRPC:
+    def batch(self, requests_to_send):
+        return [self.call(method, params) for method, params in requests_to_send]
+
     def call(self, method, params):
         answers = {"eth_chainId": hex(4663), "eth_estimateGas": hex(110_000),
                    "eth_getBlockByNumber": {"baseFeePerGas": hex(10)},
@@ -25,6 +28,23 @@ class FakeRPC:
 
 
 class SignerTests(unittest.TestCase):
+    def test_prepare_uses_a_single_rpc_round_trip(self):
+        class CountingRPC(FakeRPC):
+            def __init__(self):
+                self.round_trips = 0
+
+            def batch(self, requests_to_send):
+                self.round_trips += 1
+                return super().batch(requests_to_send)
+
+        state = {"challenge": CHALLENGE, "difficulty": 1, "supply": 0, "price": 100}
+        config = {"wallet1_address": WALLET, "max_total_wei": 100 + 137_500 * 22}
+        rpc = CountingRPC()
+        prepare_transaction(rpc, config, state, candidate())
+        # Latency here is lost mints: a candidate is only valid until the next
+        # mint, so this path must not regress into several sequential calls.
+        self.assertEqual(rpc.round_trips, 1)
+
     def test_rejects_changed_challenge_and_insufficient_bits(self):
         state = {"challenge": "0x" + "55" * 32, "difficulty": 1}
         with self.assertRaisesRegex(ValueError, "stale"):

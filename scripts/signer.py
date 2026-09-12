@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import concurrent.futures
 import fcntl
 import hashlib
 import json
@@ -12,6 +13,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -47,9 +49,13 @@ def save_bytes(path: Path, value: bytes) -> None:
 
 def event(runtime: Path, kind: str, **fields) -> None:
     row = {"at": time.time(), "kind": kind, **fields}
-    with (runtime / "events.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+    with EVENT_LOCK:
+        with (runtime / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
     print(json.dumps(row, sort_keys=True), flush=True)
+
+
+EVENT_LOCK = threading.Lock()
 
 
 class RPCError(RuntimeError):
@@ -196,14 +202,16 @@ def remote_python(config: dict, rental: dict, code: str, *args: str) -> str:
     return ssh(config, rental, "python3 -c " + shlex.quote(code) + " " + " ".join(shlex.quote(arg) for arg in args))
 
 
-PUBLISH_CODE = """import base64, os, sys
-path='/opt/hashbroker/job.json'
+# One remote invocation publishes the job and returns everything the host has,
+# because each call costs a Python interpreter start plus a network round trip
+# (measured 220-780ms here). Splitting publish and collect doubled that on the
+# path a found proof has to travel before it can be signed.
+SYNC_CODE = """import base64, glob, json, os, sys
+root='/opt/hashbroker/'
+path=root+'job.json'
 with open(path+'.tmp','wb') as f:
  f.write(base64.b64decode(sys.argv[1])); f.flush(); os.fsync(f.fileno())
 os.replace(path+'.tmp',path)
-"""
-POLL_CODE = """import base64, glob, json, os
-root='/opt/hashbroker/'
 out={'candidates':{},'status':{}}
 for path in glob.glob(root+'solution-gpu*.json'):
  name=os.path.basename(path)
@@ -224,15 +232,12 @@ os.replace(path,'/opt/hashbroker/archive/'+digest+'.json')
 """
 
 
-def publish(config: dict, rental: dict, state: dict) -> None:
+def poll_rental(config: dict, rental: dict, state: dict, runtime: Path) -> dict:
+    """Publish a fresh job and harvest everything the host produced, in one call."""
     job = {"wallet": config["wallet1_address"], "challenge": state["challenge"],
            "difficulty": state["difficulty"], "updated_at": time.time()}
     payload = base64.b64encode(json.dumps(job, separators=(",", ":")).encode()).decode()
-    remote_python(config, rental, PUBLISH_CODE, payload)
-
-
-def ingest(config: dict, rental: dict, runtime: Path) -> dict:
-    remote = json.loads(remote_python(config, rental, POLL_CODE))
+    remote = json.loads(remote_python(config, rental, SYNC_CODE, payload))
     for name, encoded in remote["candidates"].items():
         if not re.fullmatch(r"solution-gpu\d+\.json", name):
             continue
@@ -244,6 +249,7 @@ def ingest(config: dict, rental: dict, runtime: Path) -> dict:
             save_bytes(path, raw)
             event(runtime, "candidate_received", digest=digest[:12], gpu=candidate.get("gpu"),
                   rental=rental["name"])
+        # Archive only after the exact bytes are on disk locally.
         remote_python(config, rental, ACK_CODE, name, digest)
     return {f"{rental['name']}/{name}": status for name, status in remote["status"].items()}
 
@@ -269,26 +275,37 @@ def prepare_transaction(rpc: RPC, config: dict, state: dict, candidate: dict) ->
     price, cap = state["price"], config["max_total_wei"]
     if price < 0 or price >= cap:
         raise ValueError("mint price exceeds total fee cap")
-    if int(rpc.call("eth_chainId", []), 16) != CHAIN_ID:
-        raise RuntimeError("wrong RPC chain")
     data = mine_calldata(candidate["nonce"], state["challenge"])
-    gas_estimate = int(rpc.call("eth_estimateGas", [{"from": wallet, "to": CONTRACT,
-                                                      "value": hex(price), "data": data}]), 16)
+    # One round trip instead of six. Every value below is independent, and the
+    # proof only stays valid until the next mint, so latency here is lost mints.
+    # The estimate is the call that reverts on a stale proof, which is why the
+    # error surfaces as an RPCError the caller treats as a rejected candidate.
+    chain_id, latest, priority_hex, balance_hex, nonce_hex, gas_hex = rpc.batch([
+        ("eth_chainId", []),
+        ("eth_getBlockByNumber", ["latest", False]),
+        ("eth_maxPriorityFeePerGas", []),
+        ("eth_getBalance", [wallet, "latest"]),
+        ("eth_getTransactionCount", [wallet, "pending"]),
+        ("eth_estimateGas", [{"from": wallet, "to": CONTRACT,
+                              "value": hex(price), "data": data}]),
+    ])
+    if int(chain_id, 16) != CHAIN_ID:
+        raise RuntimeError("wrong RPC chain")
+    gas_estimate = int(gas_hex, 16)
     gas = max(100_000, (gas_estimate * 125 + 99) // 100)
-    latest = rpc.call("eth_getBlockByNumber", ["latest", False])
     base_fee = int(latest.get("baseFeePerGas") or "0x0", 16)
-    priority = int(rpc.call("eth_maxPriorityFeePerGas", []), 16)
+    priority = int(priority_hex, 16)
     max_fee = 2 * base_fee + priority
     if max_fee <= 0 or base_fee < 0 or priority < 0:
         raise RuntimeError("invalid gas quote")
     total = price + gas * max_fee
     if total > cap:
         raise ValueError("mint plus maximum gas exceeds cap")
-    if int(rpc.call("eth_getBalance", [wallet, "latest"]), 16) < total:
+    if int(balance_hex, 16) < total:
         raise ValueError("wallet balance insufficient")
     return {"chainId": CHAIN_ID, "to": CONTRACT, "value": price,
             "data": data, "gas": gas, "maxPriorityFeePerGas": priority,
-            "maxFeePerGas": max_fee, "nonce": int(rpc.call("eth_getTransactionCount", [wallet, "pending"]), 16),
+            "maxFeePerGas": max_fee, "nonce": int(nonce_hex, 16),
             "type": 2}
 
 
@@ -352,6 +369,28 @@ def unprocessed_candidates(runtime: Path):
             event(runtime, "candidate_corrupt", file=path.name)
 
 
+def process_candidates(rpc: RPC, config: dict, account, runtime: Path, pending: bool) -> bool:
+    """Submit any candidate that has not been handled yet. Returns pending state."""
+    if pending:
+        return True
+    for path, candidate in unprocessed_candidates(runtime):
+        result = path.with_suffix(".result.json")
+        try:
+            submit(rpc, config, account, runtime, candidate)
+            save_json(result, {"status": "prepared", "at": time.time()})
+            return True
+        except ValueError as exc:
+            save_json(result, {"status": "rejected", "reason": str(exc), "at": time.time()})
+            event(runtime, "candidate_rejected", reason=str(exc))
+        except RPCError as exc:
+            # A revert here means the proof is not acceptable right now (almost
+            # always a challenge that moved on); retrying it forever would block
+            # the queue behind a dead proof.
+            save_json(result, {"status": "rejected", "reason": str(exc), "at": time.time()})
+            event(runtime, "candidate_reverted", reason=str(exc))
+    return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
@@ -389,33 +428,26 @@ def main() -> None:
             if state["challenge"] != previous:
                 event(runtime, "challenge", challenge=state["challenge"], difficulty=state["difficulty"])
                 previous = state["challenge"]
-            statuses = {}
-            for rental in config["rentals"]:
-                try:
-                    publish(config, rental, state)
-                    statuses.update(ingest(config, rental, runtime))
-                except Exception as exc:
-                    event(runtime, "rental_error", rental=rental["name"], error=type(exc).__name__)
-            save_json(runtime / "workers.json", {"updated_at": time.time(), "status": statuses})
+            # Poll every rental at once. Done in series, the round trips to the
+            # other hosts delay the candidate that just arrived, and a proof only
+            # stays valid until the next mint — measured at 1.6-2.7s of avoidable
+            # latency before this change.
             pending = reconcile(rpc, config, account, runtime)
-            for path, candidate in unprocessed_candidates(runtime):
-                result = path.with_suffix(".result.json")
-                if result.exists() or pending:
-                    continue
-                try:
-                    submit(rpc, config, account, runtime, candidate)
-                    save_json(result, {"status": "prepared", "at": time.time()})
-                    pending = True
-                except ValueError as exc:
-                    save_json(result, {"status": "rejected", "reason": str(exc), "at": time.time()})
-                    event(runtime, "candidate_rejected", reason=str(exc))
-                except RPCError as exc:
-                    # A revert here means the proof is not acceptable right now
-                    # (almost always a challenge that moved on); retrying it forever
-                    # would block the queue.
-                    save_json(result, {"status": "rejected", "reason": str(exc), "at": time.time()})
-                    event(runtime, "candidate_reverted", reason=str(exc))
-            time.sleep(0.5)
+            statuses = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(config["rentals"])) as pool:
+                futures = {pool.submit(poll_rental, config, rental, state, runtime): rental
+                           for rental in config["rentals"]}
+                for future in concurrent.futures.as_completed(futures):
+                    rental = futures[future]
+                    try:
+                        statuses.update(future.result())
+                    except Exception as exc:
+                        event(runtime, "rental_error", rental=rental["name"], error=type(exc).__name__)
+                    # Submit the moment a host reports a proof instead of waiting
+                    # for the remaining hosts to answer.
+                    pending = process_candidates(rpc, config, account, runtime, pending)
+            save_json(runtime / "workers.json", {"updated_at": time.time(), "status": statuses})
+            time.sleep(0.2)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
