@@ -1,0 +1,18 @@
+{
+  "wallet1_address": "0xYOUR_WALLET_1_ADDRESS",
+  "wallet1_provider": "key_file",
+  "wallet1_key_file": "/private/path/to/wallet.key",
+  "wallet1_manager_root": "/private/path/to/encrypted-wallet-manager",
+  "max_total_wei": 5000000000000000,
+  "rpc_urls": [
+    "https://YOUR_PAID_RPC_ENDPOINT",
+    "https://rpc.mainnet.chain.robinhood.com/"
+  ],
+  "ssh_key": "/private/path/to/rental_ed25519",
+  "known_hosts": "/private/path/to/known_hosts",
+  "runtime_dir": "/private/path/to/hashbroker-runtime",
+  "rentals": [
+    {"name": "vast-a", "host": "YOUR_VAST_SSH_HOST", "port": 0, "gpus": 8, "stream_base": 1},
+    {"name": "other-b", "host": "OTHER_SSH_HOST", "port": 0, "gpus": 4, "stream_base": 9}
+  ]
+}

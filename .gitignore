@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+config.json
+*.env
+runtime/
+known_hosts
+*.key
